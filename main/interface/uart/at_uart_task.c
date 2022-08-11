@@ -627,10 +627,214 @@ static uint8_t at_queryCmdUartDef (uint8_t *cmd_name)
     return ESP_AT_RESULT_CODE_OK;
 }
 
+
+//add:
+#include <sys/socket.h>
+#include "freertos/semphr.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+
+SemaphoreHandle_t sync_semaupdate = NULL;
+//update handle : set by esp_ota_begin(), must be freed via esp_ota_end()
+esp_ota_handle_t update_handle = 0 ;
+const esp_partition_t *update_partition = NULL;
+SemaphoreHandle_t sync_sema = NULL;
+uint8_t buff[4096] = {0};
+extern int32_t esp_at_get_socket_by_link_id(uint8_t id);
+extern uint32_t IRAM_ATTR esp_log_timestamp(void);
+static void wait_data_callback(void)
+{
+    xSemaphoreGive(sync_sema);
+}
+static uint8_t at_setupCmdSend(uint8_t para_num)
+{
+    uint32_t cnt = 0, ret = 0;
+    int32_t link_id = 0, data_length = 0;
+    int temp_data_len = 0;
+    // read parameter
+    if (esp_at_get_para_as_digit(cnt++, &link_id) != ESP_AT_PARA_PARSE_RESULT_OK) {
+        return ESP_AT_RESULT_CODE_ERROR;
+    }
+    if (esp_at_get_para_as_digit(cnt++, &data_length) != ESP_AT_PARA_PARSE_RESULT_OK) {
+        return ESP_AT_RESULT_CODE_ERROR;
+    }
+
+    // sema init
+    if (!sync_sema) {
+        sync_sema = xSemaphoreCreateBinary();
+        if (!sync_sema) {
+            return ESP_AT_RESULT_CODE_ERROR;
+        }
+    }
+
+    esp_at_port_write_data((uint8_t *)">\r\n", strlen(">\r\n"));
+    esp_at_port_enter_specific(wait_data_callback);
+
+    while (xSemaphoreTake(sync_sema, portMAX_DELAY)) {
+        temp_data_len += esp_at_port_read_data(buff + temp_data_len, data_length - temp_data_len);
+
+        if (temp_data_len == data_length) {
+            //printf("Recv %d bytes\r\n", temp_data_len);
+            esp_at_port_exit_specific();
+            temp_data_len = esp_at_port_get_data_length();
+            break;
+        }
+    }
+    
+    vSemaphoreDelete(sync_sema);
+    sync_sema = NULL;
+
+    int32_t fd = esp_at_get_socket_by_link_id(link_id);
+    if (fd >= 0) {
+        ret = send(fd, buff, data_length, MSG_DONTWAIT);  
+    }
+
+    if (temp_data_len > 0) {
+        esp_at_port_read_data(buff, temp_data_len);
+    }
+    if (fd < 0 || ret <= 0) {
+        return ESP_AT_RESULT_CODE_ERROR;
+    }
+    esp_at_port_write_data((uint8_t *)"SEND OK\r\n", strlen("SEND OK\r\n"));
+    
+    return ESP_AT_RESULT_CODE_IGNORE;
+
+}
+
+static void wait_dataupdate_callback(void)
+{
+    xSemaphoreGive(sync_semaupdate);
+}
+
+static uint8_t at_exeCmdUpdateBegin(uint8_t *cmd_name)
+{
+    esp_err_t err;
+    printf("Starting OTA process...\r\n");
+
+    const esp_partition_t *configured = esp_ota_get_boot_partition();
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+
+    if (configured != running) {
+        printf("Configured OTA boot partition at offset 0x%08x, but running from offset 0x%08x\r\n",
+                 configured->address, running->address);
+        printf("(This can happen if either the OTA boot data or preferred boot image become corrupted somehow.)\r\n");
+    }
+    printf("Running partition type %d subtype %d (offset 0x%08x)\r\n",
+             running->type, running->subtype, running->address);
+
+
+    update_partition = esp_ota_get_next_update_partition(NULL);
+    printf("Writing to partition subtype %d at offset 0x%x\r\n",
+             update_partition->subtype, update_partition->address);    
+
+    assert(update_partition != NULL);
+
+    err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
+    if (err != ESP_OK) {
+        printf("esp_ota_begin failed, error=%d\r\n", err);
+        return ESP_AT_RESULT_CODE_ERROR;
+    }
+
+    return ESP_AT_RESULT_CODE_OK;
+}
+
+static uint8_t at_setupCmdUpdateTransmit(uint8_t para_num)
+{
+    esp_err_t err;
+    uint32_t cnt = 0;
+    int32_t data_length = 0;
+    int temp_data_len = 0;
+    // read parameter
+    if (esp_at_get_para_as_digit(cnt++, &data_length) != ESP_AT_PARA_PARSE_RESULT_OK) {
+        return ESP_AT_RESULT_CODE_ERROR;
+    }
+
+    // sema init
+    if (!sync_semaupdate) {
+        sync_semaupdate = xSemaphoreCreateBinary();
+        if (!sync_semaupdate) {
+            return ESP_AT_RESULT_CODE_ERROR;
+        }
+    }
+
+    esp_at_port_write_data((uint8_t *)">\r\n", strlen(">\r\n"));
+    esp_at_port_enter_specific(wait_dataupdate_callback);
+
+    while (xSemaphoreTake(sync_semaupdate, portMAX_DELAY)) {
+        temp_data_len += esp_at_port_read_data(buff + temp_data_len, data_length - temp_data_len);
+
+        if (temp_data_len == data_length) {
+            esp_at_port_exit_specific();
+            break;
+        }
+    }
+    vSemaphoreDelete(sync_semaupdate);
+    sync_semaupdate = NULL;
+
+    //write flash
+    err = esp_ota_write( update_handle, (const void *)buff, temp_data_len);
+    if (err != ESP_OK) 
+    {
+        esp_at_port_write_data((uint8_t *)"WRITE FAIL\r\n", strlen("WRITE FAIL\r\n"));
+    }
+    else
+    {
+        esp_at_port_write_data((uint8_t *)"WRITE OK\r\n", strlen("WRITE OK\r\n"));
+    }
+    
+    return ESP_AT_RESULT_CODE_IGNORE;
+}
+
+static uint8_t at_setupCmdUpdateEnd(uint8_t para_num)
+{
+    esp_err_t err;
+    uint32_t cnt = 0;
+    int32_t execute = 0;
+    // read parameter
+    if (esp_at_get_para_as_digit(cnt++, &execute) != ESP_AT_PARA_PARSE_RESULT_OK) {
+        return ESP_AT_RESULT_CODE_ERROR;
+    }
+
+    //OTA write end
+    printf("Stop OTA process...\r\n");
+    if (esp_ota_end(update_handle) != ESP_OK) 
+    {
+        printf("esp_ota_end failed!\r\n");
+        return ESP_AT_RESULT_CODE_ERROR;
+    }
+
+    if(execute == 1)
+    {
+    	printf("Set boot partition...\r\n");
+        err = esp_ota_set_boot_partition(update_partition);
+        if (err != ESP_OK) {
+            printf("esp_ota_set_boot_partition failed! err=0x%x\r\n", err);
+            esp_at_port_write_data((uint8_t *)"FAIL\r\n", strlen("FAIL\r\n"));
+        }
+        else
+        {
+            esp_at_port_write_data((uint8_t *)"OK\r\n", strlen("OK\r\n"));
+        }
+        printf("Prepare to restart system!\r\n");
+        esp_restart();
+    }
+    else
+    {
+        return ESP_AT_RESULT_CODE_OK;
+    }
+
+    return ESP_AT_RESULT_CODE_IGNORE;
+}
+
 static esp_at_cmd_struct at_custom_cmd[] = {
     {"+UART", NULL, at_queryCmdUart, at_setupCmdUartDef, NULL},
     {"+UART_CUR", NULL, at_queryCmdUart, at_setupCmdUart, NULL},
     {"+UART_DEF", NULL, at_queryCmdUartDef, at_setupCmdUartDef, NULL},
+    {"+CISEND", NULL, NULL, at_setupCmdSend, NULL},
+    {"+UPDATEBEGIN", NULL, NULL, NULL, at_exeCmdUpdateBegin},
+    {"+UPDATESEND", NULL, NULL, at_setupCmdUpdateTransmit, NULL},
+    {"+UPDATEEND", NULL, NULL, at_setupCmdUpdateEnd, NULL},
 };
 
 void at_status_callback (esp_at_status_type status)
